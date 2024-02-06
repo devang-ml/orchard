@@ -1,5 +1,13 @@
 
 ### Collection of pipeline parallel hooks to register with the Transformer network.
+import os
+import torch.distributed as dist
+
+def _get_rank() -> int:
+    return int(os.environ.get("LOCAL_RANK", "0"))
+
+def _get_world_size() -> int:
+    return int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
 
 def PP_TransformerBlock_forward_pre_hook(module, args):
     x, input_pos, freqs_cis, mask = args
