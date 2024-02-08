@@ -3,6 +3,16 @@
 # llama2 checkpoint from Meta.
 # This code is derived from gpt-fast code snippets.
 
+from typing import Optional
+
+import torch
+import torch.nn as nn
+from torch import Tensor
+from torch.nn import functional as F
+
+from ..cache import KVCache
+from ..model_args import ModelArgs
+
 class FeedForward(nn.Module):
     def __init__(self, config: ModelArgs) -> None:
         super().__init__()
@@ -114,7 +124,7 @@ class Transformer(nn.Module):
         self.config = config
 
         self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
-        self.layers = nn.ModuleList(TransformerBlock(i, config) for i in range(config.n_layer))
+        self.layers = nn.ModuleList(TransformerBlock(i, config) for i in range(config.n_local_layers))
         self.norm = RMSNorm(config.dim, eps=config.norm_eps)
         self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
 
@@ -136,12 +146,16 @@ class Transformer(nn.Module):
         cache = torch.stack([freqs_cis.real, freqs_cis.imag], dim=-1)
         return cache.to(dtype=torch.bfloat16)
 
+    @staticmethod
+    def find_multiple(n: int, k: int) -> int:
+        return n if n % k == 0 else n + k - (n % k)
+
     def setup_caches(self, max_batch_size, max_seq_length):
         if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
             return
 
         head_dim = self.config.dim // self.config.n_head
-        max_seq_length = find_multiple(max_seq_length, 8)
+        max_seq_length = Transformer.find_multiple(max_seq_length, 8)
         self.max_seq_length = max_seq_length
         self.max_batch_size = max_batch_size
 
@@ -228,4 +242,3 @@ class Transformer(nn.Module):
 
         seq[T + 1:] = torch.cat(new_tokens)
         return seq
-
