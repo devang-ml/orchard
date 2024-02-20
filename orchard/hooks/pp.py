@@ -9,7 +9,7 @@ def _get_rank() -> int:
 def _get_world_size() -> int:
     return int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
 
-def PP_TransformerBlock_forward_pre_hook(module, args):
+def _transformerblock_forward_pre_hook(module, args):
     x, input_pos, freqs_cis, mask = args
 
     rank = _get_rank()
@@ -18,7 +18,7 @@ def PP_TransformerBlock_forward_pre_hook(module, args):
 
     return x, input_pos, freqs_cis, mask
 
-def PP_TransformerBlock_forward_hook(module, input, output):
+def _transformerblock_forward_hook(module, input, output):
     x, input_pos, freqs_cis, mask = input
 
     rank = _get_rank()
@@ -27,7 +27,7 @@ def PP_TransformerBlock_forward_hook(module, input, output):
 
     return output
 
-def PP_Transformer_forward_hook(module, input, output):
+def _transformer_forward_hook(module, input, output):
     rank = _get_rank()
     world_size = _get_world_size()
 
@@ -38,3 +38,15 @@ def PP_Transformer_forward_hook(module, input, output):
         dist.recv(output, src=world_size - 1)
 
     return output
+
+def PP_register_hooks(model):
+    rank = _get_rank()
+    world_size = _get_world_size()
+
+    model.register_forward_hook(_transformer_forward_hook)
+
+    if rank != 0:
+        model.layers[0].register_forward_pre_hook(_transformerblock_forward_pre_hook)
+
+    if rank != (world_size - 1):
+        model.layers[-1].register_forward_hook(_transformerblock_forward_hook)

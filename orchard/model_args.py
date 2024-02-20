@@ -24,6 +24,8 @@ class ModelArgs:
     head_dim: int = 64
     rope_base: float = 10000
     norm_eps: float = 1e-5
+    rank = 0
+    world_size = 1
 
     def __post_init__(self):
         if self.n_local_layers == -1:
