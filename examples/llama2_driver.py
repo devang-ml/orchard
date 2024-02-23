@@ -10,7 +10,6 @@ from sentencepiece import SentencePieceProcessor
 wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 
-from orchard.hooks.pp import PP_Transformer_forward_hook, PP_TransformerBlock_forward_hook, PP_TransformerBlock_forward_pre_hook
 from orchard.networks.transformer import Transformer, ModelArgs
 
 def _get_rank() -> int:
@@ -24,12 +23,27 @@ def _load_model(args, precision=torch.bfloat16):
     world_size = _get_world_size()
 
     config = ModelArgs.from_name(Path(args.checkpoint_path).parent.name)
-    config.n_local_layers = config.n_local_layers // world_size
+    config.rank = rank
+    config.world_size = world_size
+
+    if args.pp:
+        config.n_local_layers = config.n_local_layers // world_size
+    # elif args.tp:
+    #     config.n_head = config.n_head // world_size
+    #     config.dim = config.dim // world_size
+    #     config.n_local_heads = config.n_local_heads // world_size
 
     model = Transformer(config)
 
-    if args.pp:
-        model_path = str(args.model_path).format(rank) if args.pp else str(args.model_path)
+    # if args.tp:
+    #     for block in model.layers:
+    #         block.attention.n_head = block.attention.n_head // world_size
+    #         block.attention.dim = block.attention.dim // world_size
+    #         block.attention.head_dim = block.attention.dim // block.attention.n_head
+    #         block.attention.n_local_heads = block.attention.n_local_heads // world_size
+
+    if args.pp or args.tp:
+        model_path = str(args.model_path).format(rank)
         model.load_state_dict(torch.load(str(model_path)), assign=True)
     else:
         checkpoint = torch.load(str(args.checkpoint_path), mmap=True, weights_only=True)
@@ -37,18 +51,6 @@ def _load_model(args, precision=torch.bfloat16):
 
     model = model.to(device=args.device, dtype=precision)
     return model.eval()
-
-def _register_pp_hooks(model):
-    rank = _get_rank()
-    world_size = _get_world_size()
-
-    model.register_forward_hook(PP_Transformer_forward_hook)
-
-    if rank != 0:
-        model.layers[0].register_forward_pre_hook(PP_TransformerBlock_forward_pre_hook)
-
-    if rank != (world_size - 1):
-        model.layers[-1].register_forward_hook(PP_TransformerBlock_forward_hook)
 
 def _encode_tokens(tokenizer, string, bos=True, device='cuda'):
     tokens = tokenizer.encode(string)
@@ -73,6 +75,8 @@ def _main():
     parser.add_argument('--device', type=str, default="cuda", help='device to use')
     parser.add_argument('--pp', action="store_true", default=False,
                         help='use multiple GPUs for model distributed using Pipeline Parallel technique')
+    parser.add_argument('--tp', action="store_true", default=False,
+                        help='use multiple GPUs for model distributed using Tensor Parallel technique')
 
     args = parser.parse_args()
 
@@ -84,7 +88,7 @@ def _main():
     else:
         torch.set_default_device(args.device)
 
-    if args.pp:
+    if args.pp or args.tp:
         dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
     tokenizer_path = args.checkpoint_path.parent / "tokenizer.model"
@@ -94,7 +98,11 @@ def _main():
     model = _load_model(args)
 
     if args.pp:
-        _register_pp_hooks(model)
+        from orchard.hooks.pp import PP_register_hooks
+        PP_register_hooks(model)
+    elif args.tp:
+        from orchard.hooks.tp import TP_register_hooks
+        TP_register_hooks(model)
 
     torch.manual_seed(1234)
     generated_tokens = model.generate(
@@ -104,7 +112,7 @@ def _main():
         top_k=args.top_k,
     )
 
-    if (args.pp and rank == 0) or (not args.pp):
+    if ((args.pp or args.tp) and rank == 0) or (not (args.pp and args.tp)):
         print(tokenizer.decode(generated_tokens.tolist()))
 
     return 0
@@ -125,3 +133,6 @@ if __name__ == '__main__':
 #
 # Run with pp:
 # ENABLE_INTRA_NODE_COMM=1 torchrun --standalone --nproc_per_node=4 examples/llama2_driver.py --prompt "What's an apple?" --pp
+#
+# Run with tp:
+# ENABLE_INTRA_NODE_COMM=1 torchrun --standalone --nproc_per_node=4 examples/llama2_driver.py --prompt "What's an apple?" --tp

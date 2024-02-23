@@ -16,9 +16,10 @@ from ..model_args import ModelArgs
 class FeedForward(nn.Module):
     def __init__(self, config: ModelArgs) -> None:
         super().__init__()
-        self.w1 = nn.Linear(config.dim, config.intermediate_size, bias=False)
-        self.w3 = nn.Linear(config.dim, config.intermediate_size, bias=False)
-        self.w2 = nn.Linear(config.intermediate_size, config.dim, bias=False)
+        local_intermediate_size = config.intermediate_size // config.world_size
+        self.w1 = nn.Linear(config.dim, local_intermediate_size, bias=False)
+        self.w3 = nn.Linear(config.dim, local_intermediate_size, bias=False)
+        self.w2 = nn.Linear(local_intermediate_size, config.dim, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
@@ -41,18 +42,19 @@ class Attention(nn.Module):
         super().__init__()
         assert config.dim % config.n_head == 0
 
-        total_head_dim = (config.n_head + 2 * config.n_local_heads) * config.head_dim
-        # key, query, value projections for all heads, but in a batch
-        self.wqkv = nn.Linear(config.dim, total_head_dim, bias=False)
-        self.wo = nn.Linear(config.dim, config.dim, bias=False)
-        self.kv_cache = None
-
         self.index = index
         self.config = config
-        self.n_head = config.n_head
-        self.head_dim = config.head_dim
-        self.n_local_heads = config.n_local_heads
-        self.dim = config.dim
+        self.n_head = config.n_head // config.world_size
+        self.dim = config.dim // config.world_size
+        self.head_dim = self.dim // self.n_head
+        self.n_local_heads = config.n_local_heads // config.world_size
+
+        total_head_dim = (self.n_head + 2 * self.n_local_heads) * config.head_dim
+        # key, query, value projections for all heads, but in a batch
+        self.wqkv = nn.Linear(config.dim, total_head_dim, bias=False)
+        self.wo = nn.Linear(self.dim, config.dim, bias=False)
+        self.kv_cache = None
+
         self._register_load_state_dict_pre_hook(self.load_hook)
 
     def load_hook(self, state_dict, prefix, *args):
@@ -123,10 +125,13 @@ class Transformer(nn.Module):
         super().__init__()
         self.config = config
 
-        self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
+        # local_dim = config.dim // config.world_size
+        local_dim = config.dim
+
+        self.tok_embeddings = nn.Embedding(config.vocab_size, local_dim)
         self.layers = nn.ModuleList(TransformerBlock(i, config) for i in range(config.n_local_layers))
-        self.norm = RMSNorm(config.dim, eps=config.norm_eps)
-        self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
+        self.norm = RMSNorm(local_dim, eps=config.norm_eps)
+        self.output = nn.Linear(local_dim, config.vocab_size, bias=False)
 
         self.freqs_cis: Optional[Tensor] = None
         self.mask_cache: Optional[Tensor] = None
@@ -154,15 +159,19 @@ class Transformer(nn.Module):
         if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
             return
 
-        head_dim = self.config.dim // self.config.n_head
+        local_dim = self.config.dim //self.config.world_size
+        local_n_head = self.config.n_head // self.config.world_size
+        n_local_heads = self.config.n_local_heads // self.config.world_size
+
+        head_dim = local_dim // local_n_head
         max_seq_length = Transformer.find_multiple(max_seq_length, 8)
         self.max_seq_length = max_seq_length
         self.max_batch_size = max_batch_size
 
         for b in self.layers:
-            b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, head_dim)
+            b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, n_local_heads, head_dim)
 
-        self.freqs_cis = Transformer.precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base)
+        self.freqs_cis = Transformer.precompute_freqs_cis(self.config.block_size, head_dim, self.config.rope_base)
         self.causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
 
     def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
