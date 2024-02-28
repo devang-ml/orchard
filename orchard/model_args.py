@@ -19,23 +19,34 @@ class ModelArgs:
     n_head: int = 32
     dim: int = 4096
     intermediate_size: int = None
-    n_local_layers: int = -1
-    n_local_heads: int = -1
     head_dim: int = 64
     rope_base: float = 10000
     norm_eps: float = 1e-5
+
+    n_local_layer: int = -1
+    n_local_head: int = -1
+    local_dim: int = -1
+    local_intermediate_size: int = -1
+    local_head_dim: int = -1
+
     rank = 0
     world_size = 1
 
     def __post_init__(self):
-        if self.n_local_layers == -1:
-            self.n_local_layers = self.n_layer
-        if self.n_local_heads == -1:
-            self.n_local_heads = self.n_head
+        if self.n_local_layer == -1:
+            self.n_local_layer = self.n_layer
+        if self.n_local_head == -1:
+            self.n_local_head = self.n_head
+        if self.local_dim == -1:
+            self.local_dim = self.dim
+        if self.local_head_dim == -1:
+            self.local_head_dim = self.head_dim
         if self.intermediate_size is None:
             hidden_dim = 4 * self.dim
             n_hidden = int(2 * hidden_dim / 3)
             self.intermediate_size = ModelArgs.find_multiple(n_hidden, 256)
+        if self.local_intermediate_size == -1:
+            self.local_intermediate_size = self.intermediate_size
         self.head_dim = self.dim // self.n_head
 
     @staticmethod
