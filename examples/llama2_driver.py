@@ -1,7 +1,9 @@
 # llama2_driver
 # This is an example script to use llama2 model in single GPU or multi GPU scenario
+import itertools
 import os
 import sys
+import time
 import torch
 import torch.distributed as dist
 from pathlib import Path
@@ -27,20 +29,15 @@ def _load_model(args, precision=torch.bfloat16):
     config.world_size = world_size
 
     if args.pp:
-        config.n_local_layers = config.n_local_layers // world_size
-    # elif args.tp:
-    #     config.n_head = config.n_head // world_size
-    #     config.dim = config.dim // world_size
-    #     config.n_local_heads = config.n_local_heads // world_size
+        config.n_local_layer = config.n_local_layer // world_size
+    elif args.tp:
+        config.n_head = config.n_head // world_size
+        config.n_local_head = config.n_local_head // world_size
+        config.local_dim = config.local_dim // world_size
+        config.local_head_dim = config.local_head_dim // config.n_local_head
+        config.local_intermediate_size = config.local_intermediate_size // world_size
 
     model = Transformer(config)
-
-    # if args.tp:
-    #     for block in model.layers:
-    #         block.attention.n_head = block.attention.n_head // world_size
-    #         block.attention.dim = block.attention.dim // world_size
-    #         block.attention.head_dim = block.attention.dim // block.attention.n_head
-    #         block.attention.n_local_heads = block.attention.n_local_heads // world_size
 
     if args.pp or args.tp:
         model_path = str(args.model_path).format(rank)
@@ -58,6 +55,14 @@ def _encode_tokens(tokenizer, string, bos=True, device='cuda'):
         tokens = [tokenizer.bos_id()] + tokens
     return torch.tensor(tokens, dtype=torch.int, device=device)
 
+def device_sync(device):
+    if "cuda" in device:
+        torch.cuda.synchronize()
+    elif "cpu" in device:
+        pass
+    else:
+        print(f"device={device} is not yet supported")
+
 def _main():
     import argparse
     parser = argparse.ArgumentParser(description='This is a simple script to load and use Llama2')
@@ -69,7 +74,7 @@ def _main():
                         default=Path("models/model_{:02d}.pt"),
                         help='Ranked model path.')
     parser.add_argument('--prompt', type=str, default="Hello, my name is", help='Input prompt.')
-    parser.add_argument('--max_new_tokens', type=int, default=50, help='Maximum number of new tokens.')
+    parser.add_argument('--max_new_tokens', type=int, default=200, help='Maximum number of new tokens.')
     parser.add_argument('--top_k', type=int, default=200, help='Top-k for sampling.')
     parser.add_argument('--temperature', type=float, default=0.8, help='Temperature for sampling.')
     parser.add_argument('--device', type=str, default="cuda", help='device to use')
@@ -83,6 +88,11 @@ def _main():
     rank = _get_rank()
     world_size = _get_world_size()
 
+    global print
+    if (args.tp or args.pp) and (rank != 0):
+        # only print on rank 0
+        print = lambda *args, **kwargs: None
+
     if args.device == 'cuda':
         torch.cuda.set_device(rank)
     else:
@@ -90,11 +100,13 @@ def _main():
 
     if args.pp or args.tp:
         dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+        # args.model_path = Path('models_tp/model_{:02d}.pt') if args.tp else Path('models_pp/model_{:02d}.pt')
 
     tokenizer_path = args.checkpoint_path.parent / "tokenizer.model"
     tokenizer = SentencePieceProcessor(model_file=str(tokenizer_path))
     encoded_tokens = _encode_tokens(tokenizer, args.prompt, bos=True, device=args.device)
 
+    t0 = time.time()
     model = _load_model(args)
 
     if args.pp:
@@ -104,16 +116,28 @@ def _main():
         from orchard.hooks.tp import TP_register_hooks
         TP_register_hooks(model)
 
+    device_sync(device=args.device)
+    print(f"Time to load model: {time.time() - t0:.02f} seconds")
+
     torch.manual_seed(1234)
+    device_sync(device=args.device)
+
+    t0 = time.perf_counter()
     generated_tokens = model.generate(
         encoded_tokens,
         args.max_new_tokens,
         temperature=args.temperature,
         top_k=args.top_k,
     )
+    t = time.perf_counter() - t0
 
-    if ((args.pp or args.tp) and rank == 0) or (not (args.pp and args.tp)):
-        print(tokenizer.decode(generated_tokens.tolist()))
+    model_size = sum([p.numel() * p.dtype.itemsize for p in itertools.chain(model.parameters(), model.buffers())])
+    tokens_sec = (generated_tokens.size(0) - encoded_tokens.size(0)) / t
+
+    print(tokenizer.decode(generated_tokens.tolist()))
+    print(f"Time for inference: {t:.02f} sec total, {tokens_sec:.02f} tokens/sec")
+    print(f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s")
+    print(f"Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB")
 
     return 0
 

@@ -16,10 +16,9 @@ from ..model_args import ModelArgs
 class FeedForward(nn.Module):
     def __init__(self, config: ModelArgs) -> None:
         super().__init__()
-        local_intermediate_size = config.intermediate_size // config.world_size
-        self.w1 = nn.Linear(config.dim, local_intermediate_size, bias=False)
-        self.w3 = nn.Linear(config.dim, local_intermediate_size, bias=False)
-        self.w2 = nn.Linear(local_intermediate_size, config.dim, bias=False)
+        self.w1 = nn.Linear(config.dim, config.local_intermediate_size, bias=False)
+        self.w3 = nn.Linear(config.dim, config.local_intermediate_size, bias=False)
+        self.w2 = nn.Linear(config.local_intermediate_size, config.dim, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
@@ -44,15 +43,15 @@ class Attention(nn.Module):
 
         self.index = index
         self.config = config
-        self.n_head = config.n_head // config.world_size
-        self.dim = config.dim // config.world_size
-        self.head_dim = self.dim // self.n_head
-        self.n_local_heads = config.n_local_heads // config.world_size
+        self.n_head = config.n_head
+        self.head_dim = config.head_dim
+        self.n_local_head = config.n_local_head
+        self.local_dim = config.local_dim
 
-        total_head_dim = (self.n_head + 2 * self.n_local_heads) * config.head_dim
+        total_head_dim = (config.n_head + 2 * config.n_local_head) * config.head_dim
         # key, query, value projections for all heads, but in a batch
         self.wqkv = nn.Linear(config.dim, total_head_dim, bias=False)
-        self.wo = nn.Linear(self.dim, config.dim, bias=False)
+        self.wo = nn.Linear(config.local_dim, config.dim, bias=False)
         self.kv_cache = None
 
         self._register_load_state_dict_pre_hook(self.load_hook)
@@ -82,12 +81,12 @@ class Attention(nn.Module):
     def forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
         bsz, seqlen, _ = x.shape
 
-        kv_size = self.n_local_heads * self.head_dim
-        q, k, v = self.wqkv(x).split([self.dim, kv_size, kv_size], dim=-1)
+        kv_size = self.n_local_head * self.head_dim
+        q, k, v = self.wqkv(x).split([self.local_dim, kv_size, kv_size], dim=-1)
 
         q = q.view(bsz, seqlen, self.n_head, self.head_dim)
-        k = k.view(bsz, seqlen, self.n_local_heads, self.head_dim)
-        v = v.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        k = k.view(bsz, seqlen, self.n_local_head, self.head_dim)
+        v = v.view(bsz, seqlen, self.n_local_head, self.head_dim)
 
         q = Attention.apply_rotary_emb(q, freqs_cis)
         k = Attention.apply_rotary_emb(k, freqs_cis)
@@ -97,11 +96,11 @@ class Attention(nn.Module):
         if self.kv_cache is not None:
             k, v = self.kv_cache.update(input_pos, k, v)
 
-        k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-        v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+        k = k.repeat_interleave(self.n_head // self.n_local_head, dim=1)
+        v = v.repeat_interleave(self.n_head // self.n_local_head, dim=1)
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
 
-        y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
+        y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.local_dim)
 
         y = self.wo(y)
         return y
@@ -125,13 +124,10 @@ class Transformer(nn.Module):
         super().__init__()
         self.config = config
 
-        # local_dim = config.dim // config.world_size
-        local_dim = config.dim
-
-        self.tok_embeddings = nn.Embedding(config.vocab_size, local_dim)
-        self.layers = nn.ModuleList(TransformerBlock(i, config) for i in range(config.n_local_layers))
-        self.norm = RMSNorm(local_dim, eps=config.norm_eps)
-        self.output = nn.Linear(local_dim, config.vocab_size, bias=False)
+        self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
+        self.layers = nn.ModuleList(TransformerBlock(i, config) for i in range(config.n_local_layer))
+        self.norm = RMSNorm(config.dim, eps=config.norm_eps)
+        self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
 
         self.freqs_cis: Optional[Tensor] = None
         self.mask_cache: Optional[Tensor] = None
@@ -159,19 +155,16 @@ class Transformer(nn.Module):
         if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
             return
 
-        local_dim = self.config.dim //self.config.world_size
-        local_n_head = self.config.n_head // self.config.world_size
-        n_local_heads = self.config.n_local_heads // self.config.world_size
-
-        head_dim = local_dim // local_n_head
+        head_dim = self.config.local_dim // self.config.n_local_head
         max_seq_length = Transformer.find_multiple(max_seq_length, 8)
         self.max_seq_length = max_seq_length
         self.max_batch_size = max_batch_size
 
         for b in self.layers:
-            b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, n_local_heads, head_dim)
+            b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_head, head_dim)
 
-        self.freqs_cis = Transformer.precompute_freqs_cis(self.config.block_size, head_dim, self.config.rope_base)
+        self.freqs_cis = Transformer.precompute_freqs_cis(
+            self.config.block_size, self.config.local_dim // self.config.n_local_head, self.config.rope_base)
         self.causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
 
     def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
