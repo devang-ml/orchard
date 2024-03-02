@@ -34,7 +34,6 @@ def _load_model(args, precision=torch.bfloat16):
         config.n_head = config.n_head // world_size
         config.n_local_head = config.n_local_head // world_size
         config.local_dim = config.local_dim // world_size
-        config.local_head_dim = config.local_head_dim // config.n_local_head
         config.local_intermediate_size = config.local_intermediate_size // world_size
 
     print('Config: ', config.__dict__)

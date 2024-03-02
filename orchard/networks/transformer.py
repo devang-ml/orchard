@@ -16,6 +16,7 @@ from ..model_args import ModelArgs
 class FeedForward(nn.Module):
     def __init__(self, config: ModelArgs) -> None:
         super().__init__()
+        self.config = config
         self.w1 = nn.Linear(config.dim, config.local_intermediate_size, bias=False)
         self.w3 = nn.Linear(config.dim, config.local_intermediate_size, bias=False)
         self.w2 = nn.Linear(config.local_intermediate_size, config.dim, bias=False)
@@ -24,8 +25,9 @@ class FeedForward(nn.Module):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-5):
+    def __init__(self, config: ModelArgs, dim: int, eps: float = 1e-5):
         super().__init__()
+        self.config = config
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
@@ -36,12 +38,37 @@ class RMSNorm(nn.Module):
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
 
+class Sampler(nn.Module):
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.config = config
+
+    @torch.no_grad()
+    def forward(
+        self,
+        x: torch.Tensor,
+        embedding: torch.Tensor,
+        temperature: float = 1.0,
+        top_k: Optional[int] = None
+    ) -> torch.Tensor:
+        logits = F.linear(x, embedding)
+        logits = logits[0, -1] / max(temperature, 1e-5)
+
+        if top_k is not None:
+            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            pivot = v.select(-1, -1).unsqueeze(-1)
+            logits = torch.where(logits < pivot, -float("Inf"), logits)
+
+        probs = torch.nn.functional.softmax(logits, dim=-1)
+
+        q = torch.empty_like(probs).exponential_(1)
+        return torch.argmax(probs / q, dim=-1, keepdim=True).to(dtype=torch.int)
+
 class Attention(nn.Module):
-    def __init__(self, index: int, config: ModelArgs):
+    def __init__(self, config: ModelArgs):
         super().__init__()
         assert config.dim % config.n_head == 0
 
-        self.index = index
         self.config = config
         self.n_head = config.n_head
         self.head_dim = config.head_dim
@@ -106,13 +133,14 @@ class Attention(nn.Module):
         return y
 
 class TransformerBlock(nn.Module):
-    def __init__(self, index: int, config: ModelArgs) -> None:
+    def __init__(self, config: ModelArgs, index: int) -> None:
         super().__init__()
+        self.config = config
         self.index = index
-        self.attention = Attention(index, config)
+        self.attention = Attention(config)
         self.feed_forward = FeedForward(config)
-        self.ffn_norm = RMSNorm(config.dim, config.norm_eps)
-        self.attention_norm = RMSNorm(config.dim, config.norm_eps)
+        self.ffn_norm = RMSNorm(config, config.dim, config.norm_eps)
+        self.attention_norm = RMSNorm(config, config.dim, config.norm_eps)
 
     def forward(self, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: Tensor) -> Tensor:
         h = x + self.attention(self.attention_norm(x), freqs_cis, mask, input_pos)
@@ -125,9 +153,10 @@ class Transformer(nn.Module):
         self.config = config
 
         self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
-        self.layers = nn.ModuleList(TransformerBlock(i, config) for i in range(config.n_local_layer))
-        self.norm = RMSNorm(config.dim, eps=config.norm_eps)
+        self.layers = nn.ModuleList(TransformerBlock(config, i) for i in range(config.n_local_layer))
+        self.norm = RMSNorm(config, config.dim, eps=config.norm_eps)
         self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
+        self.sampler = Sampler(config)
 
         self.freqs_cis: Optional[Tensor] = None
         self.mask_cache: Optional[Tensor] = None
@@ -155,7 +184,7 @@ class Transformer(nn.Module):
         if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
             return
 
-        head_dim = self.config.local_dim // self.config.n_local_head
+        head_dim = self.config.local_dim // self.config.n_head
         max_seq_length = Transformer.find_multiple(max_seq_length, 8)
         self.max_seq_length = max_seq_length
         self.max_batch_size = max_batch_size
@@ -164,7 +193,7 @@ class Transformer(nn.Module):
             b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_head, head_dim)
 
         self.freqs_cis = Transformer.precompute_freqs_cis(
-            self.config.block_size, self.config.local_dim // self.config.n_local_head, self.config.rope_base)
+            self.config.block_size, self.config.local_dim // self.config.n_head, self.config.rope_base)
         self.causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
 
     def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
@@ -177,35 +206,7 @@ class Transformer(nn.Module):
             x = layer(x, input_pos, freqs_cis, mask)
 
         x = self.norm(x)
-        logits = self.output(x)
-        return logits
-
-    @staticmethod
-    def multinomial_sample_one_no_sync(probs_sort): # Does multinomial sampling without a cuda synchronization
-        q = torch.empty_like(probs_sort).exponential_(1)
-        return torch.argmax(probs_sort / q, dim=-1, keepdim=True).to(dtype=torch.int)
-
-    @staticmethod
-    def logits_to_probs(logits, temperature: float = 1.0, top_k: Optional[int] = None):
-        logits = logits / max(temperature, 1e-5)
-
-        if top_k is not None:
-            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-            pivot = v.select(-1, -1).unsqueeze(-1)
-            logits = torch.where(logits < pivot, -float("Inf"), logits)
-        probs = torch.nn.functional.softmax(logits, dim=-1)
-        return probs
-
-    @staticmethod
-    def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None):
-        probs = Transformer.logits_to_probs(logits[0, -1], temperature, top_k)
-        idx_next = Transformer.multinomial_sample_one_no_sync(probs)
-        return idx_next, probs
-
-    def prefill(self, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> torch.Tensor:
-        # input_pos: [B, S]
-        logits = self(x, input_pos)
-        return Transformer.sample(logits, **sampling_kwargs)[0]
+        return x
 
     @torch.no_grad()
     def generate(
@@ -222,8 +223,9 @@ class Transformer(nn.Module):
         with torch.device(device):
             self.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
 
+        # input_pos: [B, S]
         input_pos = torch.arange(0, T, device=device)
-        next_token = self.prefill(prompt.view(1, -1), input_pos, **sampling_kwargs)
+        next_token = self.sampler(self(prompt.view(1, -1), input_pos), self.output.weight, **sampling_kwargs)
 
         # create an empty tensor of the expected final shape and fill in the current tokens
         seq = torch.empty(T_new, dtype=dtype, device=device)
@@ -236,8 +238,7 @@ class Transformer(nn.Module):
         cur_token = next_token.view(1, -1)
         for i in range(max_new_tokens - 1):
             with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True):
-                logits = self(cur_token, input_pos)
-                next_token, _ = self.sample(logits, **sampling_kwargs)
+                next_token = self.sampler(self(cur_token, input_pos), self.output.weight, **sampling_kwargs)
                 input_pos += 1
                 new_tokens.append(next_token.clone())
                 cur_token = next_token.view(1, -1)
