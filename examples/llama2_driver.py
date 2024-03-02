@@ -37,6 +37,13 @@ def _load_model(args, precision=torch.bfloat16):
         config.local_head_dim = config.local_head_dim // config.n_local_head
         config.local_intermediate_size = config.local_intermediate_size // world_size
 
+    print('Config: ', config.__dict__)
+
+    if args.pp:
+        assert (config.n_layer % world_size) == 0
+    elif args.tp:
+        assert (config.n_head % world_size) == 0
+
     model = Transformer(config)
 
     if args.pp or args.tp:
@@ -44,6 +51,7 @@ def _load_model(args, precision=torch.bfloat16):
         model.load_state_dict(torch.load(str(model_path)), assign=True)
     else:
         checkpoint = torch.load(str(args.checkpoint_path), mmap=True, weights_only=True)
+        checkpoint = checkpoint.get('model_state_dict', checkpoint)
         model.load_state_dict(checkpoint, assign=True)
 
     model = model.to(device=args.device, dtype=precision)
@@ -131,13 +139,23 @@ def _main():
     )
     t = time.perf_counter() - t0
 
+    parameter_count = sum(p.numel() for p in model.parameters())
     model_size = sum([p.numel() * p.dtype.itemsize for p in itertools.chain(model.parameters(), model.buffers())])
     tokens_sec = (generated_tokens.size(0) - encoded_tokens.size(0)) / t
 
     print(tokenizer.decode(generated_tokens.tolist()))
+
+    print('')
+    if args.pp or args.tp:
+        print(f" Parameters / rank: {parameter_count}")
+        print(f" Model size / rank: {model_size  / 1e9:.02f} GB")
+    else:
+        print(f"        Parameters: {parameter_count}")
+        print(f"        Model size: {model_size  / 1e9:.02f} GB")
+
     print(f"Time for inference: {t:.02f} sec total, {tokens_sec:.02f} tokens/sec")
     print(f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s")
-    print(f"Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB")
+    print(f"       Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB")
 
     return 0
 
