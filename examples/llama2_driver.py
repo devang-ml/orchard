@@ -29,19 +29,19 @@ def _load_model(args, precision=torch.bfloat16):
     config.world_size = world_size
 
     if args.pp:
+        assert (config.n_layer % world_size) == 0, f'config.n_layer={config.n_layer}, world_size={world_size}'
+    elif args.tp:
+        assert (config.n_head % world_size) == 0, f'config.n_head={config.n_head}, world_size={world_size}'
+        assert config.n_local_head > 1, f'config.n_local_head={config.n_local_head}'
+
+    if args.pp:
         config.n_local_layer = config.n_local_layer // world_size
     elif args.tp:
         config.n_head = config.n_head // world_size
         config.n_local_head = config.n_local_head // world_size
-        config.local_dim = config.local_dim // world_size
         config.local_intermediate_size = config.local_intermediate_size // world_size
 
     print('Config: ', config.__dict__)
-
-    if args.pp:
-        assert (config.n_layer % world_size) == 0
-    elif args.tp:
-        assert (config.n_head % world_size) == 0
 
     model = Transformer(config)
 
@@ -64,7 +64,7 @@ def _encode_tokens(tokenizer, string, bos=True, device='cuda'):
 
 def device_sync(device):
     if "cuda" in device:
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(device)
     elif "cpu" in device:
         pass
     else:

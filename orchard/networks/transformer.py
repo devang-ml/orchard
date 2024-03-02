@@ -11,7 +11,7 @@ from torch import Tensor
 from torch.nn import functional as F
 
 from ..cache import KVCache
-from ..model_args import ModelArgs
+from ..model_args import ModelArgs, ModelArch
 
 class FeedForward(nn.Module):
     def __init__(self, config: ModelArgs) -> None:
@@ -22,7 +22,8 @@ class FeedForward(nn.Module):
         self.w2 = nn.Linear(config.local_intermediate_size, config.dim, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        approximate = 'tanh' if self.config.arch in [ModelArch.Gemma] else None
+        return self.w2(F.gelu(self.w1(x), approximate=approximate) * self.w3(x))
 
 class RMSNorm(nn.Module):
     def __init__(self, config: ModelArgs, dim: int, eps: float = 1e-5):
@@ -36,7 +37,10 @@ class RMSNorm(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         output = self._norm(x.float()).type_as(x)
-        return output * self.weight
+        if self.config.arch in [ModelArch.Gemma]:
+            return output * (1 + self.weight)
+        else:
+            return output * self.weight
 
 class Sampler(nn.Module):
     def __init__(self, config: ModelArgs):
@@ -73,12 +77,12 @@ class Attention(nn.Module):
         self.n_head = config.n_head
         self.head_dim = config.head_dim
         self.n_local_head = config.n_local_head
-        self.local_dim = config.local_dim
+        self.dim = config.n_head * config.head_dim
 
         total_head_dim = (config.n_head + 2 * config.n_local_head) * config.head_dim
         # key, query, value projections for all heads, but in a batch
         self.wqkv = nn.Linear(config.dim, total_head_dim, bias=False)
-        self.wo = nn.Linear(config.local_dim, config.dim, bias=False)
+        self.wo = nn.Linear(self.dim, config.dim, bias=False)
         self.kv_cache = None
 
         self._register_load_state_dict_pre_hook(self.load_hook)
@@ -109,7 +113,7 @@ class Attention(nn.Module):
         bsz, seqlen, _ = x.shape
 
         kv_size = self.n_local_head * self.head_dim
-        q, k, v = self.wqkv(x).split([self.local_dim, kv_size, kv_size], dim=-1)
+        q, k, v = self.wqkv(x).split([self.dim, kv_size, kv_size], dim=-1)
 
         q = q.view(bsz, seqlen, self.n_head, self.head_dim)
         k = k.view(bsz, seqlen, self.n_local_head, self.head_dim)
@@ -127,7 +131,7 @@ class Attention(nn.Module):
         v = v.repeat_interleave(self.n_head // self.n_local_head, dim=1)
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
 
-        y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.local_dim)
+        y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
 
         y = self.wo(y)
         return y
@@ -176,24 +180,19 @@ class Transformer(nn.Module):
         cache = torch.stack([freqs_cis.real, freqs_cis.imag], dim=-1)
         return cache.to(dtype=torch.bfloat16)
 
-    @staticmethod
-    def find_multiple(n: int, k: int) -> int:
-        return n if n % k == 0 else n + k - (n % k)
-
     def setup_caches(self, max_batch_size, max_seq_length):
         if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
             return
 
-        head_dim = self.config.local_dim // self.config.n_head
-        max_seq_length = Transformer.find_multiple(max_seq_length, 8)
+        max_seq_length = ModelArgs.find_multiple(max_seq_length, 8)
         self.max_seq_length = max_seq_length
         self.max_batch_size = max_batch_size
 
         for b in self.layers:
-            b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_head, head_dim)
+            b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_head, self.config.head_dim)
 
         self.freqs_cis = Transformer.precompute_freqs_cis(
-            self.config.block_size, self.config.local_dim // self.config.n_head, self.config.rope_base)
+            self.config.block_size, self.config.head_dim, self.config.rope_base)
         self.causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
 
     def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
@@ -201,6 +200,10 @@ class Transformer(nn.Module):
         mask = self.causal_mask[None, None, input_pos]
         freqs_cis = self.freqs_cis[input_pos]
         x = self.tok_embeddings(idx)
+
+        if self.config.arch in [ModelArch.Gemma]:
+            # Gemma normalizes the embedding by sqrt(dim).
+            x = x * (self.config.dim ** 0.5)
 
         for _, layer in enumerate(self.layers):
             x = layer(x, input_pos, freqs_cis, mask)

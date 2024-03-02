@@ -1,9 +1,11 @@
 # model_args
-# This class defines the model argument used by the netowrks
+# This class defines the model argument used by the networks
 from dataclasses import dataclass
 from enum import Enum
 
 class ModelArch(str, Enum):
+    Gemma = "gemma"
+    Mistral = "mistral"
     LLaMA = "llama"
 
 @dataclass
@@ -14,6 +16,9 @@ class ModelArgs:
         "llama2-30b": dict(arch=ModelArch.LLaMA, n_layer=60, n_head=52, dim=6656),
         "llama2-34b": dict(arch=ModelArch.LLaMA, n_layer=48, n_head=64, dim=8192, vocab_size=32000, n_local_head=8, intermediate_size=22016, rope_base=1000000), # CodeLlama-34B-Python-hf
         "llama2-70b": dict(arch=ModelArch.LLaMA, n_layer=80, n_head=64, dim=8192, n_local_head=8, intermediate_size=28672),
+        "mistral-7b": dict(arch=ModelArch.LLaMA, n_layer=32, n_head=32, n_local_head=8, dim=4096, vocab_size=32000, intermediate_size=14336),
+        "gemma-2b": dict(arch=ModelArch.Gemma, n_layer=18, n_head=8, dim=2048, n_local_head=1, vocab_size=256000, intermediate_size=16384),
+        "gemma-7b": dict(arch=ModelArch.Gemma, n_layer=28, n_head=16, dim=3072, n_local_head=16, head_dim=256, vocab_size=256000, intermediate_size=24576),
     }
 
     arch: ModelArch = ModelArch.LLaMA
@@ -29,7 +34,6 @@ class ModelArgs:
 
     n_local_layer: int = -1
     n_local_head: int = -1
-    local_dim: int = -1
     local_intermediate_size: int = -1
 
     rank = 0
@@ -40,8 +44,6 @@ class ModelArgs:
             self.n_local_layer = self.n_layer
         if self.n_local_head == -1:
             self.n_local_head = self.n_head
-        if self.local_dim == -1:
-            self.local_dim = self.dim
         if self.intermediate_size is None:
             hidden_dim = 4 * self.dim
             n_hidden = int(2 * hidden_dim / 3)
