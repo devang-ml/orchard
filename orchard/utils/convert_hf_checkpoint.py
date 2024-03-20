@@ -7,6 +7,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from safetensors import safe_open
 from typing import Optional
 
 import torch
@@ -20,8 +21,8 @@ from orchard.model_args import ModelArgs
 
 @torch.inference_mode()
 def convert_hf_checkpoint(
-    *,
-    checkpoint_dir: Path = Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf"),
+    checkpoint_dir: Path,
+    load_safe_tensors: bool = False,
     model_name: Optional[str] = None,
 ) -> None:
     if model_name is None:
@@ -31,8 +32,9 @@ def convert_hf_checkpoint(
     print(f"Model config {config.__dict__}")
 
     # Load the json file containing weight mapping
-    model_map_json = checkpoint_dir / "pytorch_model.bin.index.json"
-
+    model_map_json = checkpoint_dir / (
+        "model.safetensors.index.json" if load_safe_tensors else "pytorch_model.bin.index.json"
+    )
     assert model_map_json.is_file()
 
     with open(model_map_json) as json_map:
@@ -65,8 +67,13 @@ def convert_hf_checkpoint(
 
     merged_result = {}
     for file in sorted(bin_files):
-        state_dict = torch.load(str(file), map_location="cpu", mmap=True, weights_only=True)
+        if load_safe_tensors:
+            with safe_open(str(file), framework="pt", device='cpu') as safe_state_dict:
+                state_dict = {k: safe_state_dict.get_tensor(k) for k in safe_state_dict.keys()}
+        else:
+            state_dict = torch.load(str(file), map_location="cpu", mmap=True, weights_only=True)
         merged_result.update(state_dict)
+
     final_result = {}
     for key, value in merged_result.items():
         if "layers" in key:
@@ -87,22 +94,28 @@ def convert_hf_checkpoint(
             k = final_result[key.replace("wq", "wk")]
             v = final_result[key.replace("wq", "wv")]
             q = permute(q, config.n_head)
-            k = permute(k, config.n_local_heads)
+            k = permute(k, config.n_local_head)
             final_result[key.replace("wq", "wqkv")] = torch.cat([q, k, v])
             del final_result[key]
             del final_result[key.replace("wq", "wk")]
             del final_result[key.replace("wq", "wv")]
+
+    if "output.weight" not in final_result:
+        final_result["output.weight"] = final_result["tok_embeddings.weight"]
+
     print(f"Saving checkpoint to {checkpoint_dir / 'model.pth'}")
     torch.save(final_result, checkpoint_dir / "model.pth")
 
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Convert HuggingFace checkpoint.')
-    parser.add_argument('--checkpoint_dir', type=Path, default=Path("checkpoints/meta-llama/llama-2-7b-chat-hf"))
+    parser.add_argument('--checkpoint_dir', type=Path, required=True)
     parser.add_argument('--model_name', type=str, default=None)
+    parser.add_argument("--load_safe_tensors", action='store_true')
 
     args = parser.parse_args()
     convert_hf_checkpoint(
         checkpoint_dir=args.checkpoint_dir,
+        load_safe_tensors=args.load_safe_tensors,
         model_name=args.model_name,
     )
